@@ -1,9 +1,10 @@
 import express from 'express'
 import jwt from 'jsonwebtoken'
 import * as dotenv from 'dotenv'
+import { ObjectId } from 'mongodb'
 import type { RequestProps } from './types'
 import type { ChatContext, ChatMessage } from './chatgpt'
-import { chatConfig, chatReplyProcess, containsSensitiveWords, currentModel, initApi, initAuditService } from './chatgpt'
+import { chatConfig, chatReplyProcess, containsSensitiveWords, initApi, initAuditService } from './chatgpt'
 import { auth } from './middleware/auth'
 import { clearConfigCache, getCacheConfig, getOriginConfig } from './storage/config'
 import type { AuditConfig, ChatInfo, ChatOptions, Config, MailConfig, SiteConfig, UsageResponse, UserInfo } from './storage/model'
@@ -264,7 +265,7 @@ router.post('/chat', auth, async (req, res) => {
           response.data.text,
           response.data.id,
           response.data.detail?.usage as UsageResponse,
-          previousResponse)
+          previousResponse as [])
       }
       else {
         await updateChat(message._id as unknown as string,
@@ -274,7 +275,7 @@ router.post('/chat', auth, async (req, res) => {
       }
 
       if (response.data.usage) {
-        await insertChatUsage(req.headers.userId as string,
+        await insertChatUsage(new ObjectId(req.headers.userId as string),
           roomId,
           message._id,
           response.data.id,
@@ -351,8 +352,11 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   finally {
     res.end()
     try {
-      if (result == null || result === undefined || result.status !== 'Success')
+      if (result == null || result === undefined || result.status !== 'Success') {
+        if (result && result.status !== 'Success')
+          lastResponse = { text: result.message }
         result = { data: lastResponse }
+      }
 
       if (result.data === undefined)
         // eslint-disable-next-line no-unsafe-finally
@@ -365,7 +369,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
           result.data.text,
           result.data.id,
           result.data.detail?.usage as UsageResponse,
-          previousResponse)
+          previousResponse as [])
       }
       else {
         await updateChat(message._id as unknown as string,
@@ -375,7 +379,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       }
 
       if (result.data.detail?.usage) {
-        await insertChatUsage(req.headers.userId as string,
+        await insertChatUsage(new ObjectId(req.headers.userId),
           roomId,
           message._id,
           result.data.id,
@@ -417,7 +421,13 @@ router.post('/user-register', async (req, res) => {
 
     const user = await getUser(username)
     if (user != null) {
-      res.send({ status: 'Fail', message: '邮箱已存在 | The email exists', data: null })
+      if (user.status === Status.PreVerify) {
+        await sendVerifyMail(username, await getUserVerifyUrl(username))
+        throw new Error('请去邮箱中验证 | Please verify in the mailbox')
+      }
+      if (user.status === Status.AdminVerify)
+        throw new Error('请等待管理员开通 | Please wait for the admin to activate')
+      res.send({ status: 'Fail', message: '账号已存在 | The email exists', data: null })
       return
     }
     const newPassword = md5(password)
@@ -436,7 +446,7 @@ router.post('/user-register', async (req, res) => {
   }
 })
 
-router.post('/config', auth, async (req, res) => {
+router.post('/config', rootAuth, async (req, res) => {
   try {
     const userId = req.headers.userId.toString()
 
@@ -457,7 +467,10 @@ router.post('/session', async (req, res) => {
     const config = await getCacheConfig()
     const hasAuth = config.siteConfig.loginEnabled
     const allowRegister = (await getCacheConfig()).siteConfig.registerEnabled
-    res.send({ status: 'Success', message: '', data: { auth: hasAuth, allowRegister, model: currentModel(), title: config.siteConfig.siteTitle } })
+    if (config.apiModel !== 'ChatGPTAPI' && config.apiModel !== 'ChatGPTUnofficialProxyAPI')
+      config.apiModel = 'ChatGPTAPI'
+
+    res.send({ status: 'Success', message: '', data: { auth: hasAuth, allowRegister, model: config.apiModel, title: config.siteConfig.siteTitle } })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -556,7 +569,7 @@ router.post('/verify', async (req, res) => {
     const username = await checkUserVerify(token)
     const user = await getUser(username)
     if (user != null && user.status === Status.Normal) {
-      res.send({ status: 'Fail', message: '邮箱已存在 | The email exists', data: null })
+      res.send({ status: 'Fail', message: '账号已存在 | The email exists', data: null })
       return
     }
     const config = await getCacheConfig()
@@ -598,14 +611,17 @@ router.post('/verifyadmin', async (req, res) => {
 
 router.post('/setting-base', rootAuth, async (req, res) => {
   try {
-    const { apiKey, apiModel, apiBaseUrl, accessToken, timeoutMs, reverseProxy, socksProxy, socksAuth, httpsProxy } = req.body as Config
+    const { apiKey, apiModel, chatModel, apiBaseUrl, accessToken, timeoutMs, reverseProxy, socksProxy, socksAuth, httpsProxy } = req.body as Config
 
-    if (apiKey == null && accessToken == null)
-      throw new Error('Missing OPENAI_API_KEY or OPENAI_ACCESS_TOKEN environment variable.')
+    if (apiModel === 'ChatGPTAPI' && !isNotEmptyString(apiKey))
+      throw new Error('Missing OPENAI_API_KEY environment variable.')
+    else if (apiModel === 'ChatGPTUnofficialProxyAPI' && !isNotEmptyString(accessToken))
+      throw new Error('Missing OPENAI_ACCESS_TOKEN environment variable.')
 
     const thisConfig = await getOriginConfig()
     thisConfig.apiKey = apiKey
     thisConfig.apiModel = apiModel
+    thisConfig.chatModel = chatModel
     thisConfig.apiBaseUrl = apiBaseUrl
     thisConfig.accessToken = accessToken
     thisConfig.reverseProxy = reverseProxy

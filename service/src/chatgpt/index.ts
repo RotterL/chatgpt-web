@@ -11,7 +11,8 @@ import { textAuditServices } from '../utils/textAudit'
 import { getCacheConfig, getOriginConfig } from '../storage/config'
 import { sendResponse } from '../utils'
 import { isNotEmptyString } from '../utils/is'
-import type { ApiModel, ChatContext, ChatGPTUnofficialProxyAPIOptions, ModelConfig } from '../types'
+import type { ChatContext, ChatGPTUnofficialProxyAPIOptions, ModelConfig } from '../types'
+import { getChatByMessageId } from '../storage/mongo'
 import type { RequestOptions } from './types'
 
 const { HttpsProxyAgent } = httpsProxyAgent
@@ -27,7 +28,6 @@ const ErrorCodeMessage: Record<string, string> = {
   500: '[OpenAI] 服务器繁忙，请稍后再试 | Internal Server Error',
 }
 
-let apiModel: ApiModel
 let api: ChatGPTAPI | ChatGPTUnofficialProxyAPI
 let auditService: TextAuditService
 
@@ -38,15 +38,16 @@ export async function initApi() {
   if (!config.apiKey && !config.accessToken)
     throw new Error('Missing OPENAI_API_KEY or OPENAI_ACCESS_TOKEN environment variable')
 
-  if (isNotEmptyString(config.apiKey)) {
+  if (config.apiModel === 'ChatGPTAPI') {
     const OPENAI_API_BASE_URL = config.apiBaseUrl
-    const OPENAI_API_MODEL = config.apiModel
-    const model = isNotEmptyString(OPENAI_API_MODEL) ? OPENAI_API_MODEL : 'gpt-3.5-turbo'
+    const model = config.chatModel
 
     const options: ChatGPTAPIOptions = {
       apiKey: config.apiKey,
       completionParams: { model },
       debug: !config.apiDisableDebug,
+      messageStore: undefined,
+      getMessageById,
     }
     // increase max token limit if use gpt-4
     if (model.toLowerCase().includes('gpt-4')) {
@@ -67,13 +68,12 @@ export async function initApi() {
     await setupProxy(options)
 
     api = new ChatGPTAPI({ ...options })
-    apiModel = 'ChatGPTAPI'
   }
   else {
-    const model = isNotEmptyString(config.apiModel) ? config.apiModel : 'gpt-3.5-turbo'
+    const model = config.chatModel
     const options: ChatGPTUnofficialProxyAPIOptions = {
       accessToken: config.accessToken,
-      apiReverseProxyUrl: isNotEmptyString(config.reverseProxy) ? config.reverseProxy : 'https://bypass.churchless.tech/api/conversation',
+      apiReverseProxyUrl: isNotEmptyString(config.reverseProxy) ? config.reverseProxy : 'https://ai.fakeopen.com/api/conversation',
       model,
       debug: !config.apiDisableDebug,
     }
@@ -81,27 +81,26 @@ export async function initApi() {
     await setupProxy(options)
 
     api = new ChatGPTUnofficialProxyAPI({ ...options })
-    apiModel = 'ChatGPTUnofficialProxyAPI'
   }
 }
 
 async function chatReplyProcess(options: RequestOptions) {
   const config = await getCacheConfig()
-  const model = isNotEmptyString(config.apiModel) ? config.apiModel : 'gpt-3.5-turbo'
+  const model = config.chatModel
   const { message, lastContext, process, systemMessage, temperature, top_p } = options
 
   try {
     const timeoutMs = (await getCacheConfig()).timeoutMs
     let options: SendMessageOptions = { timeoutMs }
 
-    if (apiModel === 'ChatGPTAPI') {
+    if (config.apiModel === 'ChatGPTAPI') {
       if (isNotEmptyString(systemMessage))
         options.systemMessage = systemMessage
       options.completionParams = { model, temperature, top_p }
     }
 
     if (lastContext != null) {
-      if (apiModel === 'ChatGPTAPI')
+      if (config.apiModel === 'ChatGPTAPI')
         options.parentMessageId = lastContext.parentMessageId
       else
         options = { ...lastContext }
@@ -146,13 +145,13 @@ async function containsSensitiveWords(audit: AuditConfig, text: string): Promise
   }
   return false
 }
-let cachedBanlance: number | undefined
+let cachedBalance: number | undefined
 let cacheExpiration = 0
 
 async function fetchBalance() {
   const now = new Date().getTime()
-  if (cachedBanlance && cacheExpiration > now)
-    return Promise.resolve(cachedBanlance.toFixed(3))
+  if (cachedBalance && cacheExpiration > now)
+    return Promise.resolve(cachedBalance.toFixed(3))
 
   // 计算起始日期和结束日期
   const startDate = new Date(now - 90 * 24 * 60 * 60 * 1000)
@@ -210,10 +209,10 @@ async function fetchBalance() {
     const totalUsage = usageData.total_usage / 100
 
     // 计算剩余额度
-    cachedBanlance = totalAmount - totalUsage
+    cachedBalance = totalAmount - totalUsage
     cacheExpiration = now + 60 * 60 * 1000
 
-    return Promise.resolve(cachedBanlance.toFixed(3))
+    return Promise.resolve(cachedBalance.toFixed(3))
   }
   catch (error) {
     global.console.error(error)
@@ -265,12 +264,35 @@ async function setupProxy(options: ChatGPTAPIOptions | ChatGPTUnofficialProxyAPI
   }
 }
 
-function currentModel(): ApiModel {
-  return apiModel
+async function getMessageById(id: string): Promise<ChatMessage | undefined> {
+  const isPrompt = id.startsWith('prompt_')
+  const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
+
+  if (chatInfo) {
+    if (isPrompt) { // prompt
+      return {
+        id,
+        conversationId: chatInfo.options.conversationId,
+        parentMessageId: chatInfo.options.parentMessageId,
+        role: 'user',
+        text: chatInfo.prompt,
+      }
+    }
+    else {
+      return { // completion
+        id,
+        conversationId: chatInfo.options.conversationId,
+        parentMessageId: `prompt_${id}`, // parent message is the prompt
+        role: 'assistant',
+        text: chatInfo.response,
+      }
+    }
+  }
+  else { return undefined }
 }
 
 initApi()
 
 export type { ChatContext, ChatMessage }
 
-export { chatReplyProcess, chatConfig, currentModel, containsSensitiveWords }
+export { chatReplyProcess, chatConfig, containsSensitiveWords }
